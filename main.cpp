@@ -2123,24 +2123,20 @@ private:
         kModeAlbumShuffle,   // 专辑随机
     };
 
-    // 专辑 = 同一父文件夹的连续行（列表按路径排序，同专辑天然连续）。
-    // 过滤/自定义排序破坏连续性时按单曲专辑处理，避免专辑模式乱跳
-    std::pair<int, int> albumBounds(int row) const {
-        if (!m_filter.isEmpty() || m_lastSortColumn >= 0)
-            return {row, row};
+    // 专辑 = 同一父文件夹的所有行（按表格顺序返回行号列表）。
+    // 不依赖「同文件夹连续行」：任意排序/过滤状态下专辑语义均成立
+    QList<int> albumRows(int row) const {
         const auto dirOf = [this](int r) {
             return QFileInfo(m_playlistModel->item(r, 0)->data(Qt::UserRole).toString())
                 .dir()
                 .path();
         };
+        QList<int> rows;
         const QString dir = dirOf(row);
-        int start = row;
-        while (start > 0 && dirOf(start - 1) == dir)
-            --start;
-        int end = row;
-        while (end + 1 < m_playlistModel->rowCount() && dirOf(end + 1) == dir)
-            ++end;
-        return {start, end};
+        for (int r = 0; r < m_playlistModel->rowCount(); ++r)
+            if (dirOf(r) == dir)
+                rows << r;
+        return rows;
     }
 
     // 播放模式切换：随机模式立即洗牌；切换后旧的洗牌队列与回退历史作废
@@ -2151,11 +2147,6 @@ private:
         else
             m_shuffleQueue.clear();
         m_history.clear();
-        // 过滤/排序状态下专辑模式退化为单曲，提前告知
-        if ((m_mode == kModeAlbumLoop || m_mode == kModeAlbumShuffle)
-            && (!m_filter.isEmpty() || m_lastSortColumn >= 0))
-            statusBar()->showMessage(
-                QStringLiteral("过滤/排序状态下专辑模式按单曲处理"), 5000);
     }
 
     // 按播放模式计算自动切歌的下一行；返回 -1 表示停止。
@@ -2179,16 +2170,20 @@ private:
             return shuffleNextRow();
         }
         case kModeAlbumLoop: {
-            const auto bounds = albumBounds(m_currentRow);
-            return m_currentRow + 1 <= bounds.second ? m_currentRow + 1 : bounds.first;
+            // 表中当前行之后的下一个同目录行；没有则回该目录第一行
+            const QList<int> rows = albumRows(m_currentRow);
+            for (int r : rows)
+                if (r > m_currentRow)
+                    return r;
+            return rows.isEmpty() ? -1 : rows.first();
         }
         case kModeAlbumShuffle: {
-            const auto bounds = albumBounds(m_currentRow);
-            if (bounds.first == bounds.second)
+            const QList<int> rows = albumRows(m_currentRow);
+            if (rows.size() <= 1)
                 return -1; // 单曲专辑无从随机，停止
             int r = m_currentRow;
             while (r == m_currentRow)
-                r = int(QRandomGenerator::global()->bounded(bounds.first, bounds.second + 1));
+                r = rows[int(QRandomGenerator::global()->bounded(rows.size()))];
             return r;
         }
         case kModeSequential:
@@ -2210,16 +2205,21 @@ private:
         case kModeShuffle:
             return m_history.isEmpty() ? -1 : m_history.takeLast();
         case kModeAlbumLoop: {
-            const auto bounds = albumBounds(m_currentRow);
-            return m_currentRow - 1 >= bounds.first ? m_currentRow - 1 : bounds.second;
+            // 表中当前行之前最近的同目录行；没有则回该目录最后一行
+            const QList<int> rows = albumRows(m_currentRow);
+            int prev = -1;
+            for (int r : rows)
+                if (r < m_currentRow)
+                    prev = r;
+            return prev >= 0 ? prev : (rows.isEmpty() ? -1 : rows.last());
         }
         case kModeAlbumShuffle: {
-            const auto bounds = albumBounds(m_currentRow);
-            if (bounds.first == bounds.second)
+            const QList<int> rows = albumRows(m_currentRow);
+            if (rows.size() <= 1)
                 return -1;
             int r = m_currentRow;
             while (r == m_currentRow)
-                r = int(QRandomGenerator::global()->bounded(bounds.first, bounds.second + 1));
+                r = rows[int(QRandomGenerator::global()->bounded(rows.size()))];
             return r;
         }
         case kModeSequential:
