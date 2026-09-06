@@ -24,6 +24,7 @@
 #include <QKeyEvent>
 #include <QSettings>
 #include <QStatusBar>
+#include <QMenu>
 #include <QComboBox>
 #include <QRandomGenerator>
 #include <QItemSelectionModel>
@@ -264,6 +265,19 @@ public:
     }
 
 protected:
+    void mousePressEvent(QMouseEvent *event) override {
+        // 右键按下未选中的行：先选中该行再交给基类。
+        // 基类 extendedSelectionCommand 对「右键未选中的行」会执行 ClearAndSelect
+        // （发生在右键菜单事件之前，直接清掉多选）；先选中可让其返回 NoUpdate，
+        // 保证：右键已选中行不动多选、右键未选中行只选该行。
+        if (event->button() == Qt::RightButton) {
+            const QModelIndex index = indexAt(event->position().toPoint());
+            if (index.isValid() && !selectionModel()->isSelected(index))
+                selectRow(index.row());
+        }
+        QTableView::mousePressEvent(event);
+    }
+
     void resizeEvent(QResizeEvent *event) override {
         QTableView::resizeEvent(event);
         applyProportions();
@@ -363,16 +377,12 @@ public:
         auto *central = new QWidget(this);
         auto *layout = new QVBoxLayout(central);
 
-        // 顶部：列表操作
+        // 顶部：列表操作（移除选中 / 清空列表已移到列表右键菜单）
         auto *toolbar = new QHBoxLayout;
         auto *addFiles = new QPushButton(QStringLiteral("添加文件"), central);
         auto *addDir = new QPushButton(QStringLiteral("添加文件夹"), central);
-        auto *removeSel = new QPushButton(QStringLiteral("移除选中"), central);
-        auto *clearAll = new QPushButton(QStringLiteral("清空列表"), central);
         toolbar->addWidget(addFiles);
         toolbar->addWidget(addDir);
-        toolbar->addWidget(removeSel);
-        toolbar->addWidget(clearAll);
         layout->addLayout(toolbar);
 
         // 中部：播放列表（文件名 | 专辑 | 序号 | 歌曲 | 大小 | 格式 | 音质 | 时长，
@@ -395,6 +405,10 @@ public:
         // 竖向滚动条带当前播放位置标记
         m_scrollBar = new MarkerScrollBar(m_playlist);
         m_playlist->setVerticalScrollBar(m_scrollBar);
+        // 右键菜单：移除选中 / 清空列表
+        m_playlist->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(m_playlist, &QWidget::customContextMenuRequested, this,
+                &PlayerWindow::showPlaylistMenu);
         layout->addWidget(m_playlist, /*stretch=*/1);
 
         // 中部两列：左侧当前曲目名，右侧歌词三行
@@ -451,18 +465,20 @@ public:
 
         auto *infoColumn = new QVBoxLayout;
         infoColumn->setSpacing(2);
+        // 上下 stretch 撑满：wordWrap 标签才能按实际宽度换行，
+        // 直接用 AlignVCenter 会卡在单行 sizeHint 高度导致长歌名被裁
+        infoColumn->addStretch();
         infoColumn->addWidget(m_artist);
         infoColumn->addWidget(m_title);
+        infoColumn->addStretch();
 
         auto *leftColumn = new QHBoxLayout;
         leftColumn->setSpacing(8);
-        leftColumn->addWidget(m_cover);
+        leftColumn->addWidget(m_cover, 0, Qt::AlignVCenter);
         leftColumn->addLayout(infoColumn, 1);
-        leftColumn->setAlignment(infoColumn, Qt::AlignVCenter);
 
         auto *middleLayout = new QHBoxLayout;
         middleLayout->addLayout(leftColumn, 1); // 左列 20%
-        middleLayout->setAlignment(leftColumn, Qt::AlignVCenter);
         middleLayout->addLayout(lyricColumn, 4); // 右列歌词 80%
         layout->addLayout(middleLayout);
 
@@ -519,8 +535,6 @@ public:
 
         connect(addFiles, &QPushButton::clicked, this, &PlayerWindow::addFiles);
         connect(addDir, &QPushButton::clicked, this, &PlayerWindow::addDirectory);
-        connect(removeSel, &QPushButton::clicked, this, &PlayerWindow::removeSelected);
-        connect(clearAll, &QPushButton::clicked, this, &PlayerWindow::clearPlaylist);
         connect(m_playlist, &QTableView::doubleClicked, this, &PlayerWindow::onRowDoubleClicked);
         connect(m_play, &QPushButton::clicked, this, &PlayerWindow::togglePlay);
         connect(m_prev, &QPushButton::clicked, this, &PlayerWindow::playPrevious);
@@ -730,6 +744,41 @@ private:
         updateScrollMarker();
         m_shuffleQueue.clear();
         m_history.clear();
+    }
+
+    // 列表右键菜单：全选 / 移除 / 清空列表。
+    // 清空列表容易误操作：仅当列表已全选时才出现在菜单里（先全选、再右键清空）。
+    // 右键点击的行不在选中集合时先选中该行，明确「移除」的作用对象。
+    void showPlaylistMenu(const QPoint &pos) {
+        // pos 是视图坐标（含表头偏移），indexAt 需要视口坐标
+        const QModelIndex index =
+            m_playlist->indexAt(m_playlist->viewport()->mapFrom(m_playlist, pos));
+        if (index.isValid() && !m_playlist->selectionModel()->isSelected(index))
+            m_playlist->selectRow(index.row());
+
+        const int n = m_playlistModel->rowCount();
+        const bool allSelected =
+            n > 0 && m_playlist->selectionModel()->selectedRows().size() == n;
+
+        QMenu menu(this);
+        QAction *removeAct = menu.addAction(QStringLiteral("移除"));
+        removeAct->setEnabled(m_playlist->selectionModel()->hasSelection());
+        QAction *selectAllAct = menu.addAction(QStringLiteral("全选"));
+        selectAllAct->setEnabled(n > 0 && !allSelected);
+        menu.addSeparator();
+        QAction *clearAct = menu.addAction(QStringLiteral("清空列表"));
+        clearAct->setVisible(allSelected); // 未全选时不显示，防止误点
+
+        const QAction *chosen = menu.exec(m_playlist->mapToGlobal(pos));
+        // 菜单关闭后把焦点还给列表视图：macOS 上选中色随焦点状态渲染，
+        // 焦点不在视图时蓝色框会退成灰色
+        m_playlist->setFocus();
+        if (chosen == selectAllAct)
+            m_playlist->selectAll();
+        else if (chosen == removeAct)
+            removeSelected();
+        else if (chosen == clearAct)
+            clearPlaylist();
     }
 
     // ---------- 播放 ----------
