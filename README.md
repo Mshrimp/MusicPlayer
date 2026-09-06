@@ -81,6 +81,12 @@
 - 表格元数据缓存 → `meta_cache.json`（mtime 失效重读，启动/切列表免全量解析标签）
 - 窗口几何、音量、播放模式、当前曲目与播放位置 → QSettings
 
+## 应用图标
+
+- 蓝底圆角 + 白色八分音符（底色 #0066CC 与应用内强调色一致），QPainter 运行时绘制
+- 打包 .app 用 `./build/music_player --export-icon <目录>` 导出 `MusicPlayer.icns`
+  （仓库根目录已含一份）
+
 ## 环境要求
 
 - macOS 12.3 Monterey (Intel x86_64)

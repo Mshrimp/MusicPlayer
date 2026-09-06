@@ -24,6 +24,7 @@
 #include <QDropEvent>
 #include <QMimeData>
 #include <QPainter>
+#include <QPainterPath>
 #include <QStyledItemDelegate>
 #include <QTimer>
 #include <QShortcut>
@@ -38,6 +39,7 @@
 #include <QFile>
 #include <QSaveFile>
 #include <QElapsedTimer>
+#include <QProcess>
 #include <QStandardPaths>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -110,6 +112,58 @@ bool isAudioFile(const QString &path) {
         QStringLiteral("wav"), QStringLiteral("ogg"), QStringLiteral("aac"),
     };
     return suffixes.contains(QFileInfo(path).suffix().toLower());
+}
+
+// ---------- 应用图标 ----------
+
+// 蓝底圆角 + 白色外星人头像（foobar2000 式扁平风格）：
+// 大圆头收窄到尖下巴，两只向外倾斜的杏仁大眼（镂空露底色）；
+// 底色用应用内强调色 #0066CC
+QIcon makeAppIcon() {
+    QIcon icon;
+    for (int size : {16, 32, 64, 128, 256, 512, 1024}) {
+        QPixmap pm(size, size);
+        pm.fill(Qt::transparent);
+        QPainter p(&pm);
+        p.setRenderHint(QPainter::Antialiasing);
+        const qreal s = size;
+
+        // 圆角蓝底
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0, 102, 204));
+        p.drawRoundedRect(QRectF(0, 0, s, s), 0.22 * s, 0.22 * s);
+
+        // 白色外星人头：大圆头 + 收窄脸颊 + 尖下巴（左右对称）
+        QPainterPath head;
+        head.moveTo(0.18 * s, 0.45 * s);
+        head.cubicTo(0.18 * s, 0.10 * s, 0.82 * s, 0.10 * s, 0.82 * s, 0.45 * s);
+        head.cubicTo(0.82 * s, 0.62 * s, 0.66 * s, 0.70 * s, 0.50 * s, 0.85 * s);
+        head.cubicTo(0.34 * s, 0.70 * s, 0.18 * s, 0.62 * s, 0.18 * s, 0.45 * s);
+        head.closeSubpath();
+        p.setBrush(Qt::white);
+        p.drawPath(head);
+
+        // 杏仁大眼：向外倾斜的椭圆镂空（露出蓝底）
+        const auto drawEye = [&](qreal cx, qreal cy, qreal rx, qreal ry, qreal angle) {
+            p.save();
+            p.translate(cx * s, cy * s);
+            p.rotate(angle);
+            p.setBrush(QColor(0, 102, 204));
+            p.drawEllipse(QRectF(-rx * s, -ry * s, 2 * rx * s, 2 * ry * s));
+            p.restore();
+        };
+        drawEye(0.37, 0.40, 0.052, 0.088, 14.0);  // 左眼
+        drawEye(0.63, 0.40, 0.052, 0.088, -14.0); // 右眼
+
+        // 微笑嘴形：蓝色下弧线
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(0, 102, 204), 0.035 * s, Qt::SolidLine, Qt::RoundCap));
+        p.drawArc(QRectF(0.40 * s, 0.53 * s, 0.20 * s, 0.12 * s),
+                  180 * 16, 180 * 16); // 下半圆弧 = 微笑
+        p.end();
+        icon.addPixmap(pm);
+    }
+    return icon;
 }
 
 // ---------- LRC 歌词 ----------
@@ -2554,11 +2608,47 @@ private:
     int m_lyricIndex = -1;     // 当前显示的歌词行
 };
 
+// --export-icon <目录>：生成 PNG 图标集与 MusicPlayer.icns（打包 .app 时用）
+int exportAppIcon(const QString &outDir) {
+    const QString iconset = outDir + QStringLiteral("/MusicPlayer.iconset");
+    QDir().mkpath(iconset);
+    const QIcon icon = makeAppIcon();
+    const struct {
+        int size;
+        const char *name;
+    } kSizes[] = {
+        {16, "icon_16x16.png"},     {32, "icon_16x16@2x.png"},
+        {32, "icon_32x32.png"},     {64, "icon_32x32@2x.png"},
+        {128, "icon_128x128.png"},  {256, "icon_128x128@2x.png"},
+        {256, "icon_256x256.png"},  {512, "icon_256x256@2x.png"},
+        {512, "icon_512x512.png"},  {1024, "icon_512x512@2x.png"},
+    };
+    for (const auto &entry : kSizes)
+        icon.pixmap(entry.size, entry.size).save(iconset + QLatin1Char('/') + entry.name);
+    QProcess proc;
+    proc.start(QStringLiteral("iconutil"),
+               {QStringLiteral("-c"), QStringLiteral("icns"), iconset,
+                QStringLiteral("-o"), outDir + QStringLiteral("/MusicPlayer.icns")});
+    proc.waitForFinished(30000);
+    return proc.exitCode();
+}
+
 int main(int argc, char *argv[]) {
     QCoreApplication::setOrganizationName(QStringLiteral("MusicPlayer"));
     QCoreApplication::setApplicationName(QStringLiteral("MusicPlayer"));
     QApplication app(argc, argv);
     app.setQuitOnLastWindowClosed(true); // 关窗即退出（closeEvent 已保存状态），避免驻留 Dock 产生双实例
+    app.setWindowIcon(makeAppIcon()); // 窗口标题栏 + Dock 图标
+
+    const QStringList args = app.arguments();
+    const int exportIdx = args.indexOf(QStringLiteral("--export-icon"));
+    if (exportIdx >= 0 && exportIdx + 1 < args.size()) {
+        const int code = exportAppIcon(args.at(exportIdx + 1));
+        if (code == 0)
+            qInfo() << "图标已导出到" << args.at(exportIdx + 1);
+        return code;
+    }
+
     PlayerWindow w;
     w.show();
     return app.exec();
