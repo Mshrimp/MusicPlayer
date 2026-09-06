@@ -12,6 +12,7 @@
 #include <QDir>
 #include <QDirIterator>
 #include <QSet>
+#include <QHash>
 #include <QBrush>
 #include <QColor>
 #include <QSlider>
@@ -19,6 +20,9 @@
 #include <QStyleOptionSlider>
 #include <QMouseEvent>
 #include <QCloseEvent>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QMimeData>
 #include <QPainter>
 #include <QStyledItemDelegate>
 #include <QTimer>
@@ -33,6 +37,7 @@
 #include <QItemSelectionModel>
 #include <QFile>
 #include <QSaveFile>
+#include <QElapsedTimer>
 #include <QStandardPaths>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -90,6 +95,21 @@ QString formatTime(qint64 ms) {
 QString playlistsFilePath() {
     return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
         + QStringLiteral("/playlists.json");
+}
+
+// 元数据缓存持久化路径（同一目录）
+QString metaCacheFilePath() {
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+        + QStringLiteral("/meta_cache.json");
+}
+
+// 按扩展名判断是否为支持的音频文件（拖拽添加用）
+bool isAudioFile(const QString &path) {
+    static const QSet<QString> suffixes = {
+        QStringLiteral("mp3"), QStringLiteral("flac"), QStringLiteral("m4a"),
+        QStringLiteral("wav"), QStringLiteral("ogg"), QStringLiteral("aac"),
+    };
+    return suffixes.contains(QFileInfo(path).suffix().toLower());
 }
 
 // ---------- LRC 歌词 ----------
@@ -271,13 +291,21 @@ public:
     void setBaseColumnWidths(std::initializer_list<int> widths) {
         m_base = widths;
         applyProportions();
-        connect(horizontalHeader(), &QHeaderView::sectionResized, this, [this]() {
-            if (m_applying)
+        connect(horizontalHeader(), &QHeaderView::sectionResized, this,
+                [this](int logicalIndex) {
+            if (m_applying || logicalIndex < 0 || logicalIndex >= m_base.size())
                 return; // 忽略等比分配自身触发的信号
-            m_base.clear();
-            for (int c = 0; c < model()->columnCount(); ++c)
-                m_base << columnWidth(c);
+            // 用户拖动边界：该列固定为新宽度，其余可见列等比填充剩余空间
+            m_base[logicalIndex] = columnWidth(logicalIndex);
+            m_fixedColumn = logicalIndex;
+            applyProportions();
         });
+    }
+
+    // 列显隐变化后重新分配可见列宽度：
+    // setColumnHidden 不触发 resizeEvent，必须显式重排，否则右侧留空
+    void relayoutColumns() {
+        applyProportions();
     }
 
 protected:
@@ -296,6 +324,7 @@ protected:
 
     void resizeEvent(QResizeEvent *event) override {
         QTableView::resizeEvent(event);
+        m_fixedColumn = -1; // 窗口缩放：所有列恢复等比
         applyProportions();
     }
 
@@ -306,24 +335,44 @@ private:
         const int total = viewport()->width();
         if (total <= 0)
             return;
+        // 刚被用户拖过的列保持宽度不动，其余可见列分配剩余空间
+        int fixedW = 0;
+        if (m_fixedColumn >= 0 && m_fixedColumn < m_base.size()
+            && !isColumnHidden(m_fixedColumn)) {
+            fixedW = columnWidth(m_fixedColumn);
+        } else {
+            m_fixedColumn = -1;
+        }
+        const int rest = total - fixedW;
+        if (rest <= 0)
+            return; // 固定列占满视口（极端拖动），交给横向滚动条
+
         int baseSum = 0;
-        for (int w : m_base)
-            baseSum += w;
+        for (int c = 0; c < m_base.size(); ++c)
+            if (!isColumnHidden(c) && c != m_fixedColumn) // 隐藏列与固定列不参与
+                baseSum += m_base[c];
         if (baseSum <= 0)
             return;
 
         m_applying = true;
         int used = 0;
+        int firstVisible = -1;
         for (int c = 0; c < m_base.size(); ++c) {
-            const int w = m_base[c] * total / baseSum;
+            if (isColumnHidden(c) || c == m_fixedColumn)
+                continue;
+            const int w = m_base[c] * rest / baseSum;
             setColumnWidth(c, w);
             used += w;
+            if (firstVisible < 0)
+                firstVisible = c;
         }
-        setColumnWidth(0, columnWidth(0) + (total - used)); // 余数给第一列，避免右侧留缝
+        if (firstVisible >= 0) // 余数给第一可见列，避免右侧留缝
+            setColumnWidth(firstVisible, columnWidth(firstVisible) + (rest - used));
         m_applying = false;
     }
 
     QList<int> m_base;
+    int m_fixedColumn = -1; // 用户刚拖动的列：保持其宽度，其余列填充剩余空间
     bool m_applying = false;
 };
 
@@ -454,6 +503,17 @@ class PlayerWindow : public QMainWindow {
         int lastRow = -1; // 离开该列表时的位置（内存记忆，切回时恢复选中/滚动）
     };
 
+    // 表格元数据缓存：切换大列表时避免全量重读 TagLib（mtime 变化时重读）
+    struct TrackMeta {
+        QString title;
+        QString album;
+        unsigned int track = 0;
+        int seconds = 0;
+        int bitrate = 0;
+        int sampleRate = 0;
+        qint64 mtime = 0;
+    };
+
 public:
     PlayerWindow() {
         setWindowTitle(QStringLiteral("Music Player"));
@@ -484,6 +544,12 @@ public:
         // 各列按基础宽度等比缩放（拖动窗口边框时同步缩放）
         m_playlist->horizontalHeader()->setStretchLastSection(false);
         m_playlist->setBaseColumnWidths({190, 150, 50, 160, 75, 55, 90, 60});
+        // 点击表头排序 + 右键表头勾选列显隐
+        connect(m_playlist->horizontalHeader(), &QHeaderView::sectionClicked,
+                this, &PlayerWindow::onHeaderSectionClicked);
+        m_playlist->horizontalHeader()->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(m_playlist->horizontalHeader(), &QWidget::customContextMenuRequested,
+                this, &PlayerWindow::onHeaderMenu);
         // 竖向滚动条带当前播放位置标记
         m_scrollBar = new MarkerScrollBar(m_playlist);
         m_playlist->setVerticalScrollBar(m_scrollBar);
@@ -503,6 +569,23 @@ public:
         listHeader->addStretch();
         listHeader->addWidget(m_listInfoLabel);
         layout->addLayout(listHeader);
+
+        // 搜索框：⌘F 唤起，输入即过滤（文件名/歌曲/专辑），清空自动隐藏
+        m_searchEdit = new QLineEdit(central);
+        m_searchEdit->setPlaceholderText(QStringLiteral("搜索：文件名 / 歌曲 / 专辑（⌘F）"));
+        m_searchEdit->setClearButtonEnabled(true);
+        m_searchEdit->setAcceptDrops(false); // 拖拽落到搜索框时冒泡给主窗口添加歌曲
+        m_searchEdit->hide();
+        connect(m_searchEdit, &QLineEdit::textChanged, this, [this](const QString &text) {
+            const QString needle = text.trimmed();
+            if (needle == m_filter)
+                return;
+            m_filter = needle;
+            showActivePlaylist(); // 过滤后重建表格，行号语义与激活列表一致
+            if (needle.isEmpty())
+                m_searchEdit->hide(); // 清空（Esc/清除按钮）后自动收起
+        });
+        layout->addWidget(m_searchEdit);
 
         layout->addWidget(m_playlist, /*stretch=*/1);
 
@@ -634,16 +717,28 @@ public:
         m_modeBox->setToolTip(QStringLiteral("播放模式"));
         connect(m_modeBox, qOverload<int>(&QComboBox::currentIndexChanged), this,
                 &PlayerWindow::onModeChanged);
+        m_speedBox = new QComboBox(central);
+        m_speedBox->addItems({QStringLiteral("0.5x"), QStringLiteral("0.75x"),
+                              QStringLiteral("1.0x"), QStringLiteral("1.25x"),
+                              QStringLiteral("1.5x"), QStringLiteral("2.0x")});
+        m_speedBox->setToolTip(QStringLiteral("播放速度"));
+        connect(m_speedBox, qOverload<int>(&QComboBox::currentIndexChanged), this,
+                [this](int index) {
+                    static const double kRates[] = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0};
+                    m_player->setPlaybackRate(kRates[index]);
+                });
         controls->addWidget(m_prev);
         controls->addWidget(m_play);
         controls->addWidget(m_next);
         controls->addStretch();
+        controls->addWidget(m_speedBox);
         controls->addWidget(m_modeBox);
         controls->addWidget(volumeLabel);
         controls->addWidget(m_volume);
         rootLayout->addLayout(controls);
 
         setCentralWidget(central);
+        setAcceptDrops(true); // 拖拽文件/文件夹到窗口添加歌曲
         resize(840, 640);
 
         // 播放器
@@ -672,6 +767,14 @@ public:
         connect(m_volume, &QSlider::valueChanged, this, [this](int value) {
             m_audio->setVolume(value / 100.0);
         });
+
+        // 睡眠定时：到时渐弱音量后暂停
+        m_sleepTimer = new QTimer(this);
+        m_sleepTimer->setSingleShot(true);
+        connect(m_sleepTimer, &QTimer::timeout, this, &PlayerWindow::onSleepTimeout);
+        m_fadeTimer = new QTimer(this);
+        m_fadeTimer->setInterval(100); // 渐弱步进：每秒降 10%
+        connect(m_fadeTimer, &QTimer::timeout, this, &PlayerWindow::onFadeTick);
 
         // 选中/滚动后空闲 30 秒：视图回到当前播放歌曲位置
         m_idleTimer = new QTimer(this);
@@ -741,31 +844,57 @@ private:
         updateListHeader();
         refreshSidebar(); // 同步侧栏歌曲数
         savePlaylistsJson();
+        saveMetaCache(); // 新解析的标签即时落盘，下次启动免重读
     }
 
-    // 纯行工厂：读一次标签生成 8 列行并追加到模型（不做去重与列表记账）
-    void appendRowForPath(const QString &path, const QString &rootDir) {
-        // 读一次标签，同时取歌曲名 / 专辑名 / 曲目编号 / 时长 / 码率 / 采样率
-        QString title;
-        QString album;
-        unsigned int track = 0;
-        int seconds = 0;
-        int bitrate = 0;
-        int sampleRate = 0;
-        const TagLib::FileRef ref(path.toUtf8().constData());
-        if (!ref.isNull()) {
-            if (ref.tag()) {
-                title = QString::fromStdWString(ref.tag()->title().toWString()).trimmed();
-                album = QString::fromStdWString(ref.tag()->album().toWString()).trimmed();
-                track = ref.tag()->track();
+    // 路径 → 缓存元数据（缺失或 mtime 变化时解析标签）
+    const TrackMeta &metaForPath(const QString &path) {
+        const qint64 mtime = QFileInfo(path).lastModified().toSecsSinceEpoch();
+        auto it = m_metaCache.find(path);
+        if (it == m_metaCache.end() || it->mtime != mtime) {
+            TrackMeta meta;
+            meta.mtime = mtime;
+            // 读一次标签，同时取歌曲名 / 专辑名 / 曲目编号 / 时长 / 码率 / 采样率
+            const TagLib::FileRef ref(path.toUtf8().constData());
+            if (!ref.isNull()) {
+                if (ref.tag()) {
+                    meta.title =
+                        QString::fromStdWString(ref.tag()->title().toWString()).trimmed();
+                    meta.album =
+                        QString::fromStdWString(ref.tag()->album().toWString()).trimmed();
+                    meta.track = ref.tag()->track();
+                }
+                if (ref.audioProperties()) {
+                    const auto *ap = ref.audioProperties();
+                    meta.seconds = ap->lengthInSeconds();
+                    meta.bitrate = ap->bitrate();
+                    meta.sampleRate = ap->sampleRate();
+                }
             }
-            if (ref.audioProperties()) {
-                const auto *ap = ref.audioProperties();
-                seconds = ap->lengthInSeconds();
-                bitrate = ap->bitrate();
-                sampleRate = ap->sampleRate();
-            }
+            it = m_metaCache.insert(path, meta);
         }
+        return it.value();
+    }
+
+    // 搜索匹配：文件名 / 歌曲名 / 专辑（大小写不敏感）
+    bool matchesFilter(const QString &path) {
+        const TrackMeta &meta = metaForPath(path);
+        return QFileInfo(path).fileName().contains(m_filter, Qt::CaseInsensitive)
+            || meta.title.contains(m_filter, Qt::CaseInsensitive)
+            || meta.album.contains(m_filter, Qt::CaseInsensitive);
+    }
+
+    // 纯行工厂：读一次标签生成 8 列行并追加到模型（不做去重与列表记账）。
+    // 元数据按路径缓存（mtime 变化时重读），切换大列表时不再全量解析标签
+    void appendRowForPath(const QString &path, const QString &rootDir) {
+        const TrackMeta &meta = metaForPath(path);
+        const QString &title = meta.title;
+        QString album = meta.album;
+        const unsigned int track = meta.track;
+        const int seconds = meta.seconds;
+        const int bitrate = meta.bitrate;
+        const int sampleRate = meta.sampleRate;
+
         // 无专辑标签时退回所在子文件夹名（rootDir 为空即逐文件添加时总是显示；
         // 添加文件夹时仅当文件不在根目录下才显示）。
         if (album.isEmpty()) {
@@ -834,15 +963,18 @@ private:
         const QModelIndexList sel = m_playlist->selectionModel()->selectedRows();
         for (const QModelIndex &idx : sel)
             rows << idx.row();
+        if (rows.isEmpty())
+            return;
         std::sort(rows.begin(), rows.end(), std::greater<int>());
+        snapshotForUndo(); // 支持 ⌘Z 撤销
 
         Playlist &pl = activePlaylist();
         int removedBelow = 0;
         bool removedCurrent = false;
-        for (int row : rows) { // 行号降序：pl.paths 与模型行序一一对应，removeAt 安全
+        for (int row : rows) { // 行号降序；按路径移除（过滤态下表格行 ≠ 列表下标）
             const QString path =
                 m_playlistModel->item(row, 0)->data(Qt::UserRole).toString();
-            pl.paths.removeAt(row);
+            pl.paths.removeAll(path);
             pl.pathSet.remove(path);
             if (row < m_currentRow)
                 ++removedBelow;
@@ -869,6 +1001,8 @@ private:
     }
 
     void clearPlaylist() {
+        if (m_playlistModel->rowCount() > 0)
+            snapshotForUndo(); // 支持 ⌘Z 撤销
         m_player->stop();
         m_playlistModel->setRowCount(0);
         activePlaylist().paths.clear();
@@ -905,6 +1039,17 @@ private:
         removeAct->setEnabled(m_playlist->selectionModel()->hasSelection());
         QAction *selectAllAct = menu.addAction(QStringLiteral("全选"));
         selectAllAct->setEnabled(n > 0 && !allSelected);
+        QAction *removeMissingAct = menu.addAction(QStringLiteral("清理失效文件"));
+        removeMissingAct->setEnabled(n > 0);
+        QAction *undoAct = menu.addAction(QStringLiteral("撤销移除"));
+        undoAct->setEnabled(m_undoSnapshot.valid); // 有快照才可撤销（快捷键 ⌘Z）
+        QMenu *sleepMenu = menu.addMenu(QStringLiteral("睡眠定时"));
+        QAction *sleepOffAct = sleepMenu->addAction(QStringLiteral("关闭"));
+        QAction *sleep15Act = sleepMenu->addAction(QStringLiteral("15 分钟"));
+        QAction *sleep30Act = sleepMenu->addAction(QStringLiteral("30 分钟"));
+        QAction *sleep45Act = sleepMenu->addAction(QStringLiteral("45 分钟"));
+        QAction *sleep60Act = sleepMenu->addAction(QStringLiteral("60 分钟"));
+        QAction *sleep90Act = sleepMenu->addAction(QStringLiteral("90 分钟"));
         menu.addSeparator();
         QAction *clearAct = menu.addAction(QStringLiteral("清空列表"));
         clearAct->setVisible(allSelected); // 未全选时不显示，防止误点
@@ -921,6 +1066,22 @@ private:
             m_playlist->selectAll();
         else if (chosen == removeAct)
             removeSelected();
+        else if (chosen == removeMissingAct)
+            removeMissingFiles();
+        else if (chosen == undoAct)
+            undoRemove();
+        else if (chosen == sleepOffAct)
+            cancelSleepTimer();
+        else if (chosen == sleep15Act)
+            startSleepTimer(15);
+        else if (chosen == sleep30Act)
+            startSleepTimer(30);
+        else if (chosen == sleep45Act)
+            startSleepTimer(45);
+        else if (chosen == sleep60Act)
+            startSleepTimer(60);
+        else if (chosen == sleep90Act)
+            startSleepTimer(90);
         else if (chosen == clearAct)
             clearPlaylist();
     }
@@ -1026,8 +1187,11 @@ private:
         m_history.clear();
 
         const Playlist &pl = activePlaylist();
-        for (const QString &path : pl.paths)
+        for (const QString &path : pl.paths) {
+            if (!m_filter.isEmpty() && !matchesFilter(path))
+                continue; // 搜索过滤态：只建匹配行
             appendRowForPath(path, QString()); // 无根目录语义：专辑回退显示所在文件夹名
+        }
         updateScrollMarker();
 
         const int n = m_playlistModel->rowCount();
@@ -1172,6 +1336,222 @@ private:
         }
         refreshSidebar();
         savePlaylistsJson();
+    }
+
+    // ---------- 搜索 / 排序 / 清理 / 撤销 / 睡眠定时 ----------
+
+    // ⌘F：唤起/收起搜索框
+    void toggleSearch() {
+        if (m_searchEdit->isVisible()) {
+            m_searchEdit->clear(); // textChanged 清过滤并自动隐藏
+        } else {
+            m_searchEdit->show();
+            m_searchEdit->setFocus();
+            m_searchEdit->selectAll();
+        }
+    }
+
+    void onHeaderSectionClicked(int column) {
+        sortPlaylistByColumn(column);
+    }
+
+    // 点击表头排序：按列重排激活列表（同列再点反向）。
+    // 注意：专辑播放模式依赖「同文件夹连续行」，任意重排后该语义会减弱，属预期取舍
+    void sortPlaylistByColumn(int column) {
+        Playlist &pl = activePlaylist();
+        if (pl.paths.size() < 2)
+            return;
+        if (column == m_lastSortColumn)
+            m_sortAscending = !m_sortAscending;
+        else {
+            m_lastSortColumn = column;
+            m_sortAscending = true;
+        }
+        const bool asc = m_sortAscending;
+        const auto fileName = [](const QString &p) { return QFileInfo(p).fileName(); };
+        std::sort(pl.paths.begin(), pl.paths.end(),
+                  [&](const QString &a, const QString &b) {
+            if (a == b)
+                return false;
+            bool less = false;
+            switch (column) {
+            case 0: // 文件名：自然排序
+                less = pathLessThan(fileName(a), fileName(b));
+                break;
+            case 1: { // 专辑 → 序号 → 路径
+                const TrackMeta &ma = metaForPath(a);
+                const TrackMeta &mb = metaForPath(b);
+                if (ma.album != mb.album) less = ma.album < mb.album;
+                else if (ma.track != mb.track) less = ma.track < mb.track;
+                else less = pathLessThan(a, b);
+                break;
+            }
+            case 2: { // 序号 → 文件名
+                const TrackMeta &ma = metaForPath(a);
+                const TrackMeta &mb = metaForPath(b);
+                if (ma.track != mb.track) less = ma.track < mb.track;
+                else less = pathLessThan(fileName(a), fileName(b));
+                break;
+            }
+            case 3: { // 歌曲名 → 路径
+                const TrackMeta &ma = metaForPath(a);
+                const TrackMeta &mb = metaForPath(b);
+                if (ma.title != mb.title) less = ma.title < mb.title;
+                else less = pathLessThan(a, b);
+                break;
+            }
+            case 4: { // 文件大小 → 路径
+                const qint64 sa = QFileInfo(a).size();
+                const qint64 sb = QFileInfo(b).size();
+                if (sa != sb) less = sa < sb;
+                else less = pathLessThan(a, b);
+                break;
+            }
+            case 5: { // 格式 → 路径
+                const QString ea = QFileInfo(a).suffix();
+                const QString eb = QFileInfo(b).suffix();
+                if (ea != eb) less = ea < eb;
+                else less = pathLessThan(a, b);
+                break;
+            }
+            case 6: { // 音质（码率/采样率） → 路径
+                const TrackMeta &ma = metaForPath(a);
+                const TrackMeta &mb = metaForPath(b);
+                const int qa = ma.bitrate * 1000 + ma.sampleRate;
+                const int qb = mb.bitrate * 1000 + mb.sampleRate;
+                if (qa != qb) less = qa < qb;
+                else less = pathLessThan(a, b);
+                break;
+            }
+            default: { // 时长 → 路径
+                const TrackMeta &ma = metaForPath(a);
+                const TrackMeta &mb = metaForPath(b);
+                if (ma.seconds != mb.seconds) less = ma.seconds < mb.seconds;
+                else less = pathLessThan(a, b);
+                break;
+            }
+            }
+            return asc ? less : !less;
+        });
+        m_shuffleQueue.clear();
+        m_history.clear();
+        showActivePlaylist();
+        savePlaylistsJson();
+        statusBar()->showMessage(
+            QStringLiteral("已按「%1」%2排序")
+                .arg(m_playlistModel->headerData(column, Qt::Horizontal).toString(),
+                     asc ? QStringLiteral("升序") : QStringLiteral("降序")),
+            3000);
+    }
+
+    // 表头右键菜单：勾选显示/隐藏列（持久化到 QSettings）
+    void onHeaderMenu(const QPoint &pos) {
+        QMenu menu(this);
+        QVector<QAction *> acts;
+        for (int c = 0; c < m_playlistModel->columnCount(); ++c) {
+            QAction *act = menu.addAction(
+                m_playlistModel->headerData(c, Qt::Horizontal).toString());
+            act->setCheckable(true);
+            act->setChecked(!m_playlist->isColumnHidden(c));
+            acts << act;
+        }
+        const QAction *chosen =
+            menu.exec(m_playlist->horizontalHeader()->mapToGlobal(pos));
+        for (int c = 0; c < acts.size(); ++c) {
+            if (chosen != acts[c])
+                continue;
+            m_playlist->setColumnHidden(c, !m_playlist->isColumnHidden(c));
+            m_playlist->relayoutColumns(); // 立即重排可见列，填满整行
+            QVariantList hiddenCols;
+            for (int i = 0; i < m_playlistModel->columnCount(); ++i)
+                if (m_playlist->isColumnHidden(i))
+                    hiddenCols << i;
+            QSettings().setValue(QStringLiteral("columns/hidden"), hiddenCols);
+            break;
+        }
+    }
+
+    // 一键移除文件已不存在的路径（清理失效文件）
+    void removeMissingFiles() {
+        Playlist &pl = activePlaylist();
+        QStringList missing;
+        for (const QString &p : pl.paths)
+            if (!QFileInfo::exists(p))
+                missing << p;
+        if (missing.isEmpty()) {
+            statusBar()->showMessage(QStringLiteral("没有失效文件"), 3000);
+            return;
+        }
+        snapshotForUndo(); // 支持 ⌘Z 撤销
+        for (const QString &p : missing) {
+            pl.paths.removeAll(p);
+            pl.pathSet.remove(p);
+        }
+        showActivePlaylist();
+        refreshSidebar();
+        savePlaylistsJson();
+        statusBar()->showMessage(
+            QStringLiteral("已移除 %1 个失效文件").arg(missing.size()), 5000);
+    }
+
+    // 移除/清空前快照激活列表，⌘Z 可撤销恢复
+    void snapshotForUndo() {
+        m_undoSnapshot.playlist = m_activePlaylist;
+        m_undoSnapshot.paths = activePlaylist().paths;
+        m_undoSnapshot.valid = true;
+    }
+
+    void undoRemove() {
+        if (!m_undoSnapshot.valid || m_undoSnapshot.playlist < 0
+            || m_undoSnapshot.playlist >= m_playlists.size())
+            return;
+        Playlist &pl = m_playlists[m_undoSnapshot.playlist];
+        pl.paths = m_undoSnapshot.paths;
+        pl.pathSet = QSet<QString>(pl.paths.begin(), pl.paths.end());
+        m_undoSnapshot.valid = false;
+        if (m_undoSnapshot.playlist == m_activePlaylist)
+            showActivePlaylist();
+        refreshSidebar();
+        savePlaylistsJson();
+        statusBar()->showMessage(QStringLiteral("已撤销移除"), 3000);
+    }
+
+    // 睡眠定时：到时 10 秒内渐弱音量后暂停，随后恢复原音量
+    void startSleepTimer(int minutes) {
+        m_fadeTimer->stop();
+        m_sleepTimer->start(minutes * 60 * 1000);
+        statusBar()->showMessage(
+            QStringLiteral("睡眠定时：%1 分钟后渐弱停止").arg(minutes), 5000);
+    }
+
+    void cancelSleepTimer() {
+        m_sleepTimer->stop();
+        if (m_fadeTimer->isActive()) {
+            m_fadeTimer->stop();
+            m_volume->setValue(m_sleepVolumeBefore); // 渐弱中途取消则恢复音量
+        }
+        statusBar()->showMessage(QStringLiteral("睡眠定时已取消"), 3000);
+    }
+
+    void onSleepTimeout() {
+        m_sleepVolumeBefore = m_volume->value();
+        if (m_sleepVolumeBefore <= 0) {
+            m_player->pause();
+            statusBar()->showMessage(QStringLiteral("睡眠定时：已暂停播放"), 5000);
+            return;
+        }
+        m_fadeTimer->start();
+    }
+
+    void onFadeTick() {
+        if (m_volume->value() > 0) {
+            m_volume->setValue(m_volume->value() - 1);
+            return;
+        }
+        m_fadeTimer->stop();
+        m_player->pause();
+        m_volume->setValue(m_sleepVolumeBefore);
+        statusBar()->showMessage(QStringLiteral("睡眠定时：已暂停播放"), 5000);
     }
 
     // ---------- 播放 ----------
@@ -1388,6 +1768,39 @@ private:
         QMainWindow::closeEvent(event);
     }
 
+    // 拖拽添加：接受 Finder 拖入的文件与文件夹（递归收集音频文件）
+    void dragEnterEvent(QDragEnterEvent *event) override {
+        if (event->mimeData()->hasUrls())
+            event->acceptProposedAction();
+        else
+            QMainWindow::dragEnterEvent(event);
+    }
+
+    void dropEvent(QDropEvent *event) override {
+        QStringList paths;
+        const QList<QUrl> urls = event->mimeData()->urls();
+        for (const QUrl &url : urls) {
+            const QString path = url.toLocalFile();
+            if (path.isEmpty())
+                continue;
+            const QFileInfo info(path);
+            if (info.isDir()) {
+                QDirIterator it(path, kAudioSuffixes,
+                                QDir::Files | QDir::Readable,
+                                QDirIterator::Subdirectories);
+                while (it.hasNext())
+                    paths << it.next();
+            } else if (isAudioFile(path)) {
+                paths << path;
+            }
+        }
+        if (paths.isEmpty())
+            return;
+        std::sort(paths.begin(), paths.end(), pathLessThan);
+        addToActivePlaylist(paths, QString());
+        event->acceptProposedAction();
+    }
+
     // ---------- 键盘操作 ----------
 
     // 全局按键过滤：用 nativeVirtualKey（macOS 原生虚拟键码）识别按键，
@@ -1398,11 +1811,23 @@ private:
             return QMainWindow::eventFilter(obj, event);
         if (QApplication::activeModalWidget()) // 文件选择对话框等模态窗口打开时不拦截
             return false;
-        // 行内编辑（侧栏列表名）获得焦点时不拦截按键：保证文本输入与中文输入法正常
-        if (qobject_cast<QLineEdit *>(QApplication::focusWidget()))
-            return false;
         auto *ke = static_cast<QKeyEvent *>(event);
         const auto mods = ke->modifiers();
+        // ⌘F 搜索、⌘Z 撤销移除：即使焦点在行内编辑框也优先处理
+        if (mods == Qt::ControlModifier) {
+            if (ke->key() == Qt::Key_F) {
+                toggleSearch();
+                return true;
+            }
+            if (ke->key() == Qt::Key_Z) {
+                undoRemove();
+                return true;
+            }
+        }
+        // 行内编辑（侧栏列表名/搜索框）获得焦点时不拦截其余按键：
+        // 保证文本输入与中文输入法正常
+        if (qobject_cast<QLineEdit *>(QApplication::focusWidget()))
+            return false;
         const int vk = ke->nativeVirtualKey();
 
         // , 和 .（即 < >）键控制上/下一首：允许带 Shift（打 < > 本身就需要 Shift），
@@ -1469,10 +1894,13 @@ private:
     }
 
     void onMediaStatusChanged(QMediaPlayer::MediaStatus status) {
-        if (status == QMediaPlayer::LoadedMedia && m_pendingPosition > 0) {
-            // 恢复上次播放位置（需等媒体加载完成）
-            m_player->setPosition(m_pendingPosition);
-            m_pendingPosition = 0;
+        if (status == QMediaPlayer::LoadedMedia) {
+            m_errorSkipCount = 0; // 成功加载后清零自动跳过计数
+            if (m_pendingPosition > 0) {
+                // 恢复上次播放位置（需等媒体加载完成）
+                m_player->setPosition(m_pendingPosition);
+                m_pendingPosition = 0;
+            }
         }
         if (status == QMediaPlayer::EndOfMedia) {
             // 按播放模式决定下一首；返回 -1 表示停止
@@ -1495,7 +1923,17 @@ private:
                                    ? QStringLiteral("格式不受支持或文件已损坏")
                                    : errorString;
         statusBar()->showMessage(
-            QStringLiteral("无法播放「%1」：%2").arg(name, detail), 8000);
+            QStringLiteral("无法播放「%1」：%2，自动跳过").arg(name, detail), 5000);
+        // 自动跳过损坏文件；连续失败达上限则停止（防止整列表坏文件死循环）
+        if (m_errorSkipCount < 5) {
+            const int next = nextRowFor();
+            if (next >= 0) {
+                ++m_errorSkipCount;
+                playRow(next);
+                return;
+            }
+        }
+        m_errorSkipCount = 0;
     }
 
     // 播放模式（枚举值与下拉框顺序一致，随 QSettings 持久化）
@@ -1630,6 +2068,65 @@ private:
         return m_shuffleQueue.isEmpty() ? -1 : m_shuffleQueue.takeFirst();
     }
 
+    // ---------- 元数据缓存持久化 ----------
+
+    // 持久化表格元数据缓存：启动时免于全量重读 TagLib。
+    // 只序列化仍在某个播放列表中的路径，保持文件有界
+    void saveMetaCache() {
+        QSet<QString> live;
+        for (const Playlist &pl : m_playlists)
+            live.unite(pl.pathSet);
+
+        QJsonArray arr;
+        for (auto it = m_metaCache.constBegin(); it != m_metaCache.constEnd(); ++it) {
+            if (!live.contains(it.key()))
+                continue;
+            const TrackMeta &m = it.value();
+            QJsonObject obj;
+            obj.insert(QStringLiteral("path"), it.key());
+            obj.insert(QStringLiteral("mtime"), double(m.mtime));
+            obj.insert(QStringLiteral("title"), m.title);
+            obj.insert(QStringLiteral("album"), m.album);
+            obj.insert(QStringLiteral("track"), int(m.track));
+            obj.insert(QStringLiteral("seconds"), m.seconds);
+            obj.insert(QStringLiteral("bitrate"), m.bitrate);
+            obj.insert(QStringLiteral("sampleRate"), m.sampleRate);
+            arr.append(obj);
+        }
+        QJsonObject root;
+        root.insert(QStringLiteral("tracks"), arr);
+
+        QSaveFile file(metaCacheFilePath());
+        if (!file.open(QIODevice::WriteOnly))
+            return;
+        file.write(QJsonDocument(root).toJson());
+        file.commit();
+    }
+
+    void loadMetaCache() {
+        QFile file(metaCacheFilePath());
+        if (!file.open(QIODevice::ReadOnly))
+            return;
+        QJsonParseError err{};
+        const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &err);
+        if (err.error != QJsonParseError::NoError || !doc.isObject())
+            return;
+        for (const QJsonValue &v : doc.object().value(QStringLiteral("tracks")).toArray()) {
+            const QJsonObject obj = v.toObject();
+            TrackMeta m;
+            m.mtime = qint64(obj.value(QStringLiteral("mtime")).toDouble());
+            m.title = obj.value(QStringLiteral("title")).toString();
+            m.album = obj.value(QStringLiteral("album")).toString();
+            m.track = unsigned(obj.value(QStringLiteral("track")).toInt());
+            m.seconds = obj.value(QStringLiteral("seconds")).toInt();
+            m.bitrate = obj.value(QStringLiteral("bitrate")).toInt();
+            m.sampleRate = obj.value(QStringLiteral("sampleRate")).toInt();
+            const QString path = obj.value(QStringLiteral("path")).toString();
+            if (!path.isEmpty())
+                m_metaCache.insert(path, m);
+        }
+    }
+
     // ---------- 播放列表持久化（JSON） ----------
 
     // 每次列表/激活索引变更立即保存（原子写）；退出时 saveState 兜底再存一次
@@ -1725,7 +2222,9 @@ private:
         settings.setValue(QStringLiteral("playback/position"),
                           m_playingPath.isEmpty() ? 0 : m_player->position());
         settings.setValue(QStringLiteral("playback/mode"), m_mode);
+        settings.setValue(QStringLiteral("playback/speed"), m_speedBox->currentIndex());
         savePlaylistsJson(); // 退出兜底保存（平时每次变更即时保存）
+        saveMetaCache();     // 元数据缓存兜底保存
     }
 
     void restoreState() {
@@ -1744,8 +2243,21 @@ private:
             m_modeBox->setCurrentIndex(mode);
         }
 
+        const int speed = settings.value(QStringLiteral("playback/speed"), 2).toInt();
+        m_speedBox->setCurrentIndex(qBound(0, speed, m_speedBox->count() - 1));
+
+        // 恢复列显隐
+        const QVariantList hiddenCols =
+            settings.value(QStringLiteral("columns/hidden")).toList();
+        for (const QVariant &v : hiddenCols) {
+            const int c = v.toInt();
+            if (c >= 0 && c < m_playlistModel->columnCount())
+                m_playlist->setColumnHidden(c, true);
+        }
+
         // 播放列表：JSON 持久化，旧版 QSettings 列表一次性迁移
         migrateOrSeedPlaylists();
+        loadMetaCache(); // 先加载元数据缓存，避免启动时全量重读标签
         refreshSidebar();
         showActivePlaylist();
 
@@ -1780,6 +2292,7 @@ private:
             m_pendingPosition = position; // 媒体加载完成后定位（见 onMediaStatusChanged）
         }
         updateListHeader();
+        saveMetaCache(); // 启动期新解析的标签立即落盘
     }
 
     void resetLabels() {
@@ -1824,12 +2337,27 @@ private:
     QSlider *m_progress = nullptr;
     QSlider *m_volume = nullptr;
     QComboBox *m_modeBox = nullptr;
+    QComboBox *m_speedBox = nullptr;
+    QLineEdit *m_searchEdit = nullptr;
     QMediaPlayer *m_player = nullptr;
     QAudioOutput *m_audio = nullptr;
     QVector<Playlist> m_playlists; // 全部播放列表，恒 >= 1 个
+    QHash<QString, TrackMeta> m_metaCache; // 路径 → 表格元数据缓存
     int m_activePlaylist = 0;      // 当前激活列表索引
     QString m_playingPath; // 已加载媒体的路径（跨列表播放锚点）；loadTrack 设置、resetLabels 清除
     QTimer *m_idleTimer = nullptr; // 选中/滚动空闲回位计时器
+    QTimer *m_sleepTimer = nullptr; // 睡眠定时（单次）
+    QTimer *m_fadeTimer = nullptr;  // 睡眠渐弱步进
+    int m_sleepVolumeBefore = 0;    // 渐弱前的音量，用于恢复
+    QString m_filter;               // 搜索过滤词（空 = 不过滤）
+    int m_lastSortColumn = -1;      // 上次排序的列（同列再点反向）
+    bool m_sortAscending = true;
+    int m_errorSkipCount = 0;       // 连续播放失败计数（自动跳过防死循环）
+    struct UndoSnapshot {           // 移除/清空前的列表快照，⌘Z 撤销
+        int playlist = -1;
+        QStringList paths;
+        bool valid = false;
+    } m_undoSnapshot;
     QList<int> m_shuffleQueue; // 随机模式洗牌队列：待播行（一轮内不重复）
     QList<int> m_history;      // 随机模式回退历史：◀◀ 按此顺序回退
     int m_currentRow = -1; // 当前播放行
