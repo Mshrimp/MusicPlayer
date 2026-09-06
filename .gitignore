@@ -1,2 +1,5 @@
 build/
+dist/
+*.dmg
 aqtinstall.log
+.DS_Store

@@ -81,6 +81,22 @@
 - 表格元数据缓存 → `meta_cache.json`（mtime 失效重读，启动/切列表免全量解析标签）
 - 窗口几何、音量、播放模式、当前曲目与播放位置 → QSettings
 
+## 打包发布（macOS）
+
+```sh
+./deploy_mac.sh
+```
+
+生成 `MusicPlayer.dmg`（41MB）与 `dist/MusicPlayer.app`，流程：
+
+1. 组装 .app 结构（二进制 + `MusicPlayer.icns` + Info.plist）
+2. `macdeployqt` 打包 Qt 框架与全部运行时插件
+3. 复制 TagLib 进 Frameworks 并用 `install_name_tool` 改写引用路径
+4. `hdiutil` 打成含 /Applications 快捷方式的 DMG
+
+注意：未签名应用在其他 Mac 上首次打开需右键 → 打开；
+彻底消除 Gatekeeper 警告需要 Apple Developer 签名 + 公证。
+
 ## 应用图标
 
 - 蓝底圆角 + 白色八分音符（底色 #0066CC 与应用内强调色一致），QPainter 运行时绘制
