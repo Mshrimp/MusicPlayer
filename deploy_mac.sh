@@ -46,6 +46,8 @@ install_name_tool -change \
     /usr/local/opt/taglib/lib/libtag.2.dylib \
     @executable_path/../Frameworks/libtag.2.dylib \
     "$STAGE/$APP/Contents/MacOS/music_player"
+install_name_tool -id @rpath/libtag.2.dylib \
+    "$STAGE/$APP/Contents/Frameworks/libtag.2.dylib"
 
 # 4. 打 DMG（含 /Applications 快捷方式）
 mkdir -p "$STAGE/dmg"
